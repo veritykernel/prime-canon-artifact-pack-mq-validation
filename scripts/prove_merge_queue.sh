@@ -10,10 +10,9 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 
 ORG_SLUG="${ORG_SLUG:-veritykernel}"
+MQ_REPO="${MQ_REPO:-$ORG_SLUG/prime-canon-artifact-pack-mq-validation}"
 SOURCE_BRANCH="${SOURCE_BRANCH:-$(git rev-parse --abbrev-ref HEAD)}"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%d%H%M%S)}"
-REPO_NAME="${REPO_NAME:-prime-canon-artifact-pack-mq-$RUN_ID}"
-MQ_REPO="${MQ_REPO:-$ORG_SLUG/$REPO_NAME}"
 WORKFLOW_FILE="publish-guard-check.yml"
 WORKFLOW_NAME="publish-guard-check"
 PROOF_BRANCH="cycle-2/mq-proof-$RUN_ID"
@@ -125,10 +124,91 @@ PY
   return 0
 }
 
+wait_for_new_merge_group_run() {
+  local repo="$1"
+  local workflow="$2"
+  local after_id="$3"
+  local loops="$4"
+
+  WAIT_STATUS=""
+  WAIT_CONCLUSION=""
+  WAIT_RUN_URL=""
+  WAIT_SEEN="false"
+
+  for _ in $(seq 1 "$loops"); do
+    RUN_JSON="$(gh api "repos/$repo/actions/runs?event=merge_group&per_page=20" 2>/dev/null || echo '{"workflow_runs": []}')"
+
+    WAIT_STATUS="$(python3 - <<'PY' "$RUN_JSON" "$after_id" "$workflow"
+import json, sys
+data = json.loads(sys.argv[1])
+after_id = int(sys.argv[2])
+workflow = sys.argv[3]
+runs = data.get("workflow_runs", [])
+found = None
+for run in runs:
+    if run.get("name") == workflow and int(run.get("id", 0)) > after_id:
+        found = run
+        break
+print(found.get("status","") if found else "")
+PY
+)"
+    WAIT_CONCLUSION="$(python3 - <<'PY' "$RUN_JSON" "$after_id" "$workflow"
+import json, sys
+data = json.loads(sys.argv[1])
+after_id = int(sys.argv[2])
+workflow = sys.argv[3]
+runs = data.get("workflow_runs", [])
+found = None
+for run in runs:
+    if run.get("name") == workflow and int(run.get("id", 0)) > after_id:
+        found = run
+        break
+print(found.get("conclusion","") if found else "")
+PY
+)"
+    WAIT_RUN_URL="$(python3 - <<'PY' "$RUN_JSON" "$after_id" "$workflow"
+import json, sys
+data = json.loads(sys.argv[1])
+after_id = int(sys.argv[2])
+workflow = sys.argv[3]
+runs = data.get("workflow_runs", [])
+found = None
+for run in runs:
+    if run.get("name") == workflow and int(run.get("id", 0)) > after_id:
+        found = run
+        break
+print(found.get("html_url","") if found else "")
+PY
+)"
+
+    if [ -n "${WAIT_STATUS:-}" ]; then
+      WAIT_SEEN="true"
+    fi
+
+    echo "merge_group $workflow status=${WAIT_STATUS:-none} conclusion=${WAIT_CONCLUSION:-none}" >&2
+
+    if [ "$WAIT_STATUS" = "completed" ]; then
+      break
+    fi
+
+    sleep 5
+  done
+
+  if [ "$WAIT_SEEN" != "true" ]; then
+    return 10
+  fi
+
+  if [ "$WAIT_STATUS" != "completed" ] || [ "$WAIT_CONCLUSION" != "success" ]; then
+    return 11
+  fi
+
+  return 0
+}
+
 gh auth status
 
 if ! gh repo view "$MQ_REPO" >/dev/null 2>&1; then
-  gh api --method POST "orgs/$ORG_SLUG/repos" -f name="$REPO_NAME" -F private=false >/dev/null
+  gh repo create "$MQ_REPO" --public >/dev/null
 fi
 
 if git remote get-url mq >/dev/null 2>&1; then
@@ -137,56 +217,19 @@ else
   git remote add mq "https://github.com/$MQ_REPO.git"
 fi
 
-REPO_ID="$(gh repo view "$MQ_REPO" --json id --jq '.id')"
-
 gh api --method PUT -H "Accept: application/vnd.github+json" "repos/$MQ_REPO/actions/permissions" -f enabled=true -f allowed_actions=all >/dev/null 2>&1 || true
 gh workflow enable "$WORKFLOW_FILE" --repo "$MQ_REPO" >/dev/null 2>&1 || true
 
-ORG_PERMS_JSON="$(gh api -H "Accept: application/vnd.github+json" "orgs/$ORG_SLUG/actions/permissions" 2>/dev/null || true)"
-if [ -n "$ORG_PERMS_JSON" ]; then
-  ENABLED_REPOSITORIES="$(python3 - <<'PY' "$ORG_PERMS_JSON"
-import json, sys
-print(json.loads(sys.argv[1]).get("enabled_repositories",""))
-PY
-)"
-  ALLOWED_ACTIONS="$(python3 - <<'PY' "$ORG_PERMS_JSON"
-import json, sys
-print(json.loads(sys.argv[1]).get("allowed_actions",""))
-PY
-)"
-  echo "org_enabled_repositories=$ENABLED_REPOSITORIES"
-  echo "org_allowed_actions=$ALLOWED_ACTIONS"
-
-  if [ "$ENABLED_REPOSITORIES" = "none" ]; then
-    echo "organization policy disables Actions for all repositories in $ORG_SLUG" >&2
-    exit 1
-  fi
-
-  if [ "$ALLOWED_ACTIONS" = "local_only" ]; then
-    echo "organization policy allows local actions only, but $WORKFLOW_FILE uses public actions" >&2
-    exit 1
-  fi
-
-  if [ "$ENABLED_REPOSITORIES" = "selected" ]; then
-    if ! gh api --method PUT -H "Accept: application/vnd.github+json" "orgs/$ORG_SLUG/actions/permissions/repositories/$REPO_ID" >/dev/null 2>&1; then
-      echo "organization policy uses selected repositories, and this token could not enable $MQ_REPO for Actions" >&2
-      echo "run: gh auth refresh -h github.com -s admin:org" >&2
-      exit 1
-    fi
-  fi
-fi
-
-MAIN_SHA="$(git rev-parse "$SOURCE_BRANCH")"
-git push mq "$SOURCE_BRANCH:main"
+git push --force-with-lease mq "$SOURCE_BRANCH:main"
 gh api --method PATCH "repos/$MQ_REPO" -f default_branch=main >/dev/null
 
+MAIN_SHA="$(git rev-parse "$SOURCE_BRANCH")"
 if wait_for_run "$MQ_REPO" "$WORKFLOW_FILE" "main" "push" "$MAIN_SHA" 36; then
   :
 else
   code="$?"
   if [ "$code" = "10" ]; then
     echo "no push run was created on main for $MQ_REPO" >&2
-    echo "if the org uses selected repositories for Actions, run: gh auth refresh -h github.com -s admin:org" >&2
     exit 1
   fi
   echo "main push workflow did not succeed in $MQ_REPO" >&2
@@ -205,7 +248,6 @@ else
   code="$?"
   if [ "$code" = "10" ]; then
     echo "no push run was created on proof branch $PROOF_BRANCH" >&2
-    echo "expected this branch to match workflow filter cycle-2/**" >&2
     exit 1
   fi
   echo "proof branch push workflow did not succeed in $MQ_REPO" >&2
@@ -254,14 +296,17 @@ cat > /tmp/prime_canon_merge_queue_ruleset.json <<'JSON'
 JSON
 
 RULESET_ID="$(gh api "repos/$MQ_REPO/rulesets" --jq '.[] | select(.name=="required-ci-publish-guard-main-mq") | .id' 2>/dev/null | head -n1 || true)"
-
 if [ -n "${RULESET_ID:-}" ]; then
-  gh api --method PUT -H "Accept: application/vnd.github+json" "repos/$MQ_REPO/rulesets/$RULESET_ID" --input /tmp/prime_canon_merge_queue_ruleset.json
+  gh api --method PUT -H "Accept: application/vnd.github+json" "repos/$MQ_REPO/rulesets/$RULESET_ID" --input /tmp/prime_canon_merge_queue_ruleset.json >/dev/null
 else
-  gh api --method POST -H "Accept: application/vnd.github+json" "repos/$MQ_REPO/rulesets" --input /tmp/prime_canon_merge_queue_ruleset.json
+  gh api --method POST -H "Accept: application/vnd.github+json" "repos/$MQ_REPO/rulesets" --input /tmp/prime_canon_merge_queue_ruleset.json >/dev/null
 fi
 
-gh pr create --repo "$MQ_REPO" --base main --head "$PROOF_BRANCH" --title "mq proof $RUN_ID" --body "Deterministic merge queue proof for publish-guard-check." >/dev/null
+if gh pr view --repo "$MQ_REPO" "$PROOF_BRANCH" >/dev/null 2>&1; then
+  :
+else
+  gh pr create --repo "$MQ_REPO" --base main --head "$PROOF_BRANCH" --title "mq proof $RUN_ID" --body "Deterministic merge queue proof for publish-guard-check." >/dev/null
+fi
 
 PR_JSON="$(gh pr view --repo "$MQ_REPO" "$PROOF_BRANCH" --json number,url,headRefOid)"
 export PR_JSON
@@ -281,7 +326,6 @@ print(json.loads(os.environ["PR_JSON"])["headRefOid"])
 PY
 )"
 
-echo "org_slug=$ORG_SLUG"
 echo "mq_repo=$MQ_REPO"
 echo "pr_number=$PR_NUMBER"
 echo "pr_url=$PR_URL"
@@ -299,14 +343,22 @@ else
   exit 1
 fi
 
+BEFORE_MG_ID="$(gh api "repos/$MQ_REPO/actions/runs?event=merge_group&per_page=1" 2>/dev/null | python3 - <<'PY'
+import json, sys
+data = json.load(sys.stdin)
+runs = data.get("workflow_runs", [])
+print(runs[0]["id"] if runs else 0)
+PY
+)"
+
 gh pr merge --repo "$MQ_REPO" "$PROOF_BRANCH" --squash --match-head-commit "$PR_HEAD_SHA"
 
-if wait_for_run "$MQ_REPO" "$WORKFLOW_FILE" "" "merge_group" "" 48; then
+if wait_for_new_merge_group_run "$MQ_REPO" "$WORKFLOW_NAME" "$BEFORE_MG_ID" 48; then
   :
 else
   code="$?"
   if [ "$code" = "10" ]; then
-    echo "no merge_group run was created in $MQ_REPO" >&2
+    echo "no new merge_group run was created in $MQ_REPO" >&2
     exit 1
   fi
   echo "merge_group $WORKFLOW_NAME did not complete successfully in $MQ_REPO" >&2
