@@ -104,7 +104,7 @@ PY
       WAIT_SEEN="true"
     fi
 
-    echo "$event $workflow branch=${branch:-any} status=${WAIT_STATUS:-none} conclusion=${WAIT_CONCLUSION:-none}" >&2
+    echo "$event $workflow branch=${branch:-any} status=${WAIT_STATUS:-none} conclusion=${WAIT_CONCLUSION:-none}"
 
     if [ "$WAIT_STATUS" = "completed" ]; then
       break
@@ -185,7 +185,7 @@ PY
       WAIT_SEEN="true"
     fi
 
-    echo "merge_group $workflow status=${WAIT_STATUS:-none} conclusion=${WAIT_CONCLUSION:-none}" >&2
+    echo "merge_group $workflow status=${WAIT_STATUS:-none} conclusion=${WAIT_CONCLUSION:-none}"
 
     if [ "$WAIT_STATUS" = "completed" ]; then
       break
@@ -220,20 +220,28 @@ fi
 gh api --method PUT -H "Accept: application/vnd.github+json" "repos/$MQ_REPO/actions/permissions" -f enabled=true -f allowed_actions=all >/dev/null 2>&1 || true
 gh workflow enable "$WORKFLOW_FILE" --repo "$MQ_REPO" >/dev/null 2>&1 || true
 
-git push --force-with-lease mq "$SOURCE_BRANCH:main"
+MAIN_SHA="$(git rev-parse "$SOURCE_BRANCH")"
+
+if git ls-remote --exit-code --heads mq main >/dev/null 2>&1; then
+  git fetch --no-tags mq refs/heads/main:refs/remotes/mq/main
+  REMOTE_MAIN_SHA="$(git rev-parse refs/remotes/mq/main)"
+  git push --force-with-lease=refs/heads/main:$REMOTE_MAIN_SHA mq "$SOURCE_BRANCH:refs/heads/main"
+else
+  git push mq "$SOURCE_BRANCH:refs/heads/main"
+fi
+
 gh api --method PATCH "repos/$MQ_REPO" -f default_branch=main >/dev/null
 
-MAIN_SHA="$(git rev-parse "$SOURCE_BRANCH")"
 if wait_for_run "$MQ_REPO" "$WORKFLOW_FILE" "main" "push" "$MAIN_SHA" 36; then
   :
 else
   code="$?"
   if [ "$code" = "10" ]; then
-    echo "no push run was created on main for $MQ_REPO" >&2
+    echo "no push run was created on main for $MQ_REPO"
     exit 1
   fi
-  echo "main push workflow did not succeed in $MQ_REPO" >&2
-  echo "run_url=${WAIT_RUN_URL:-none}" >&2
+  echo "main push workflow did not succeed in $MQ_REPO"
+  echo "run_url=${WAIT_RUN_URL:-none}"
   exit 1
 fi
 
@@ -247,11 +255,11 @@ if wait_for_run "$MQ_REPO" "$WORKFLOW_FILE" "$PROOF_BRANCH" "push" "$PR_HEAD_SHA
 else
   code="$?"
   if [ "$code" = "10" ]; then
-    echo "no push run was created on proof branch $PROOF_BRANCH" >&2
+    echo "no push run was created on proof branch $PROOF_BRANCH"
     exit 1
   fi
-  echo "proof branch push workflow did not succeed in $MQ_REPO" >&2
-  echo "run_url=${WAIT_RUN_URL:-none}" >&2
+  echo "proof branch push workflow did not succeed in $MQ_REPO"
+  echo "run_url=${WAIT_RUN_URL:-none}"
   exit 1
 fi
 
@@ -335,11 +343,11 @@ if wait_for_run "$MQ_REPO" "$WORKFLOW_FILE" "$PROOF_BRANCH" "pull_request" "$PR_
 else
   code="$?"
   if [ "$code" = "10" ]; then
-    echo "no pull_request run was created for PR #$PR_NUMBER" >&2
+    echo "no pull_request run was created for PR #$PR_NUMBER"
     exit 1
   fi
-  echo "pull_request workflow did not succeed for PR #$PR_NUMBER" >&2
-  echo "run_url=${WAIT_RUN_URL:-none}" >&2
+  echo "pull_request workflow did not succeed for PR #$PR_NUMBER"
+  echo "run_url=${WAIT_RUN_URL:-none}"
   exit 1
 fi
 
@@ -358,11 +366,11 @@ if wait_for_new_merge_group_run "$MQ_REPO" "$WORKFLOW_NAME" "$BEFORE_MG_ID" 48; 
 else
   code="$?"
   if [ "$code" = "10" ]; then
-    echo "no new merge_group run was created in $MQ_REPO" >&2
+    echo "no new merge_group run was created in $MQ_REPO"
     exit 1
   fi
-  echo "merge_group $WORKFLOW_NAME did not complete successfully in $MQ_REPO" >&2
-  echo "run_url=${WAIT_RUN_URL:-none}" >&2
+  echo "merge_group $WORKFLOW_NAME did not complete successfully in $MQ_REPO"
+  echo "run_url=${WAIT_RUN_URL:-none}"
   exit 1
 fi
 
