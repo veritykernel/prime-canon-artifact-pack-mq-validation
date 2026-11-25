@@ -17,6 +17,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from promotion_preflight import PromotionRejected, preflight
 import promote_nodes_and_current_state
 from publish_verified_subject import publish
+from check_render_drift import check as check_drift
+from secure_projection_path import write_rendered
 
 
 SOURCE = Path(__file__).resolve().parents[2]
@@ -214,7 +216,7 @@ class VerifiedPublicationTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.repo = self.root / "repo"
         for directory in ("control", "receipts", "views"):
             shutil.copytree(SOURCE / directory, self.repo / directory)
@@ -225,9 +227,14 @@ class VerifiedPublicationTests(unittest.TestCase):
         cfg = yaml.safe_load(cfg_path.read_text())
         cfg["subjects"][SUBJECT]["rendered_markdown_path"] = str(self.target)
         cfg_path.write_text(yaml.safe_dump(cfg))
+        execution_path = self.repo / "receipts" / "immutable" / SUBJECT / "render-execution.yaml"
+        execution = yaml.safe_load(execution_path.read_text())
+        view = yaml.safe_load((self.repo / "views" / "current" / f"{SUBJECT}.yaml").read_text())
+        execution["spec"]["render_view_hash"] = view["spec"]["view_hash"]
+        execution_path.write_text(yaml.safe_dump(execution, sort_keys=False))
 
     def test_publishes_the_verified_bytes(self):
-        self.assertEqual(publish(self.repo, SUBJECT), self.target)
+        self.assertEqual(publish(self.repo, SUBJECT, stage_root=self.stage), self.target)
         self.assertEqual(self.target.read_bytes(), (self.repo / "views" / "rendered" / f"{SUBJECT}.md").read_bytes())
 
     def test_changed_render_cannot_replace_existing_publication(self):
@@ -235,16 +242,87 @@ class VerifiedPublicationTests(unittest.TestCase):
         source = self.repo / "views" / "rendered" / f"{SUBJECT}.md"
         source.write_text(source.read_text() + "\nchanged after drift check\n")
         with self.assertRaisesRegex(PromotionRejected, "rendered source bytes differ"):
-            publish(self.repo, SUBJECT)
+            publish(self.repo, SUBJECT, stage_root=self.stage)
         self.assertEqual(self.target.read_text(), "prior publication")
 
     def test_symlink_target_cannot_overwrite_operator_file(self):
         protected = self.root / "operator-file"
         protected.write_text("keep")
         self.target.symlink_to(protected)
-        with self.assertRaisesRegex(PromotionRejected, "target is a symlink"):
-            publish(self.repo, SUBJECT)
+        with self.assertRaisesRegex(PromotionRejected, "target is not a regular file"):
+            publish(self.repo, SUBJECT, stage_root=self.stage)
         self.assertEqual(protected.read_text(), "keep")
+
+    def test_rendered_parent_link_cannot_redirect_source_or_builder(self):
+        external = self.root / "external"
+        external.mkdir()
+        protected = external / f"{SUBJECT}.md"
+        protected.write_text("keep")
+        shutil.rmtree(self.repo / "views" / "rendered")
+        (self.repo / "views" / "rendered").symlink_to(external)
+        with self.assertRaises(OSError):
+            write_rendered(self.repo, SUBJECT, b"changed")
+        with self.assertRaises(OSError):
+            publish(self.repo, SUBJECT, stage_root=self.stage)
+        self.assertEqual(protected.read_text(), "keep")
+
+    def test_repo_config_cannot_choose_another_stage_file(self):
+        protected = self.root / "operator-file"
+        protected.write_text("keep")
+        cfg_path = self.repo / "control" / "publish" / "publish-targets.default.yaml"
+        cfg = yaml.safe_load(cfg_path.read_text())
+        cfg["subjects"][SUBJECT]["rendered_markdown_path"] = str(protected)
+        cfg_path.write_text(yaml.safe_dump(cfg))
+        with self.assertRaisesRegex(PromotionRejected, "trusted stage root"):
+            publish(self.repo, SUBJECT, stage_root=self.stage)
+        self.assertEqual(protected.read_text(), "keep")
+
+    def test_linked_stage_component_cannot_redirect_publication(self):
+        protected_dir = self.root / "operator-dir"
+        protected_dir.mkdir()
+        protected = protected_dir / self.target.name
+        protected.write_text("keep")
+        self.stage.rmdir()
+        self.stage.symlink_to(protected_dir)
+        with self.assertRaises(OSError):
+            publish(self.repo, SUBJECT, stage_root=self.stage)
+        self.assertEqual(protected.read_text(), "keep")
+
+    def test_failed_drift_check_remains_failed_without_writing_baseline(self):
+        view_path = self.repo / "views" / "current" / f"{SUBJECT}.yaml"
+        view = yaml.safe_load(view_path.read_text())
+        view["spec"]["view_hash"] = "0" * 64
+        view_path.write_text(yaml.safe_dump(view, sort_keys=False))
+        drift_path = self.repo / "receipts" / "immutable" / SUBJECT / "render-drift.yaml"
+        before = (view_path.read_bytes(), drift_path.read_bytes())
+        self.assertEqual(check_drift(self.repo, SUBJECT), ("stale_view", "render_refresh"))
+        self.assertEqual(check_drift(self.repo, SUBJECT), ("stale_view", "render_refresh"))
+        self.assertEqual((view_path.read_bytes(), drift_path.read_bytes()), before)
+
+    def test_historical_execution_without_view_binding_fails_closed(self):
+        execution_path = self.repo / "receipts" / "immutable" / SUBJECT / "render-execution.yaml"
+        execution = yaml.safe_load(execution_path.read_text())
+        del execution["spec"]["render_view_hash"]
+        execution_path.write_text(yaml.safe_dump(execution, sort_keys=False))
+        self.assertEqual(check_drift(self.repo, SUBJECT), ("unbound_execution", "render_refresh"))
+        with self.assertRaisesRegex(PromotionRejected, "render receipts"):
+            publish(self.repo, SUBJECT, stage_root=self.stage)
+
+    def test_successor_render_freezes_current_view_hash_in_execution(self):
+        for directory in ("canon", "schemas"):
+            shutil.copytree(SOURCE / directory, self.repo / directory)
+        result = subprocess.run([sys.executable, str(SOURCE / "scripts" / "build_rendered_projection.py"),
+                                 str(self.repo), SUBJECT], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        execution = yaml.safe_load((self.repo / "receipts" / "immutable" / SUBJECT /
+                                    "render-execution.yaml").read_text())
+        view = yaml.safe_load((self.repo / "views" / "current" / f"{SUBJECT}.yaml").read_text())
+        self.assertEqual(execution["spec"]["render_view_hash"], view["spec"]["view_hash"])
+        self.assertEqual(check_drift(self.repo, SUBJECT), ("in_sync", "export_prep"))
+        export = subprocess.run([sys.executable, str(SOURCE / "scripts" / "check_export_prep.py"),
+                                 str(self.repo), SUBJECT], capture_output=True, text=True)
+        self.assertEqual(export.returncode, 0, export.stderr)
+        self.assertEqual(publish(self.repo, SUBJECT, stage_root=self.stage), self.target)
 
 
 if __name__ == "__main__":

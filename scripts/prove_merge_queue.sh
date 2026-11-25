@@ -263,7 +263,8 @@ else
   exit 1
 fi
 
-cat > /tmp/prime_canon_merge_queue_ruleset.json <<'JSON'
+ruleset_payload() {
+cat <<'JSON'
 {
   "name": "required-ci-publish-guard-main-mq",
   "target": "branch",
@@ -302,12 +303,13 @@ cat > /tmp/prime_canon_merge_queue_ruleset.json <<'JSON'
   ]
 }
 JSON
+}
 
 RULESET_ID="$(gh api "repos/$MQ_REPO/rulesets" --jq '.[] | select(.name=="required-ci-publish-guard-main-mq") | .id' 2>/dev/null | head -n1 || true)"
 if [ -n "${RULESET_ID:-}" ]; then
-  gh api --method PUT -H "Accept: application/vnd.github+json" "repos/$MQ_REPO/rulesets/$RULESET_ID" --input /tmp/prime_canon_merge_queue_ruleset.json >/dev/null
+  ruleset_payload | gh api --method PUT -H "Accept: application/vnd.github+json" "repos/$MQ_REPO/rulesets/$RULESET_ID" --input - >/dev/null
 else
-  gh api --method POST -H "Accept: application/vnd.github+json" "repos/$MQ_REPO/rulesets" --input /tmp/prime_canon_merge_queue_ruleset.json >/dev/null
+  ruleset_payload | gh api --method POST -H "Accept: application/vnd.github+json" "repos/$MQ_REPO/rulesets" --input - >/dev/null
 fi
 
 if gh pr view --repo "$MQ_REPO" "$PROOF_BRANCH" >/dev/null 2>&1; then
