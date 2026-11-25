@@ -9,6 +9,8 @@ from pathlib import Path
 import yaml
 
 from schema_contract import choose_enum, ensure_required_fields, validate_instance
+from render_binding import compute_view_hash
+from secure_projection_path import subject_name, write_rendered
 
 PROFILE_KIND = "PRIME_CANON_RENDER_PROFILE_V1"
 PLAN_KIND = "PRIME_CANON_RENDER_PLAN_V1"
@@ -20,12 +22,6 @@ NODE_KIND = "PRIME_CANON_NODE_V1"
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-def sha256_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-def sha256_file(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
 def load_yaml(path: Path):
     if not path.exists():
         raise SystemExit(f"missing yaml: {path}")
@@ -33,13 +29,12 @@ def load_yaml(path: Path):
 
 def main() -> None:
     repo = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path(".").resolve()
-    subject_slug = sys.argv[2] if len(sys.argv) > 2 else "subject-0001"
+    subject_slug = subject_name(sys.argv[2] if len(sys.argv) > 2 else "subject-0001")
 
     corpus_index_path = repo / "canon" / "corpora" / subject_slug / "index.yaml"
     view_path = repo / "views" / "current" / f"{subject_slug}.yaml"
     node_dir = repo / "canon" / "nodes" / subject_slug
     receipt_dir = repo / "receipts" / "immutable" / subject_slug
-    rendered_path = repo / "views" / "rendered" / f"{subject_slug}.md"
 
     profile_cfg_path = repo / "control" / "render" / "render-profile.default.yaml"
     order_cfg_path = repo / "control" / "render" / "render-order.default.yaml"
@@ -55,7 +50,6 @@ def main() -> None:
     if not receipt_dir.exists():
         raise SystemExit(f"missing receipt dir: {receipt_dir}")
 
-    rendered_path.parent.mkdir(parents=True, exist_ok=True)
 
     corpus = yaml.safe_load(corpus_index_path.read_text(encoding="utf-8"))
     view = yaml.safe_load(view_path.read_text(encoding="utf-8"))
@@ -340,8 +334,9 @@ def main() -> None:
         lines.append(f"- render_plan_ref: `{plan_id}`")
 
     rendered_text = "\n".join(lines) + "\n"
-    rendered_path.write_text(rendered_text, encoding="utf-8")
-    output_sha256 = sha256_file(rendered_path)
+    rendered_bytes = rendered_text.encode("utf-8")
+    write_rendered(repo, subject_slug, rendered_bytes)
+    output_sha256 = hashlib.sha256(rendered_bytes).hexdigest()
 
     prior_receipts = [
         ref for ref in view["spec"].get("derivation_receipt_refs", [])
@@ -435,15 +430,9 @@ def main() -> None:
     view["spec"]["rendered_projection_refs"] = [rendered_rel_path]
     view["spec"]["derivation_receipt_refs"] = prior_receipts + [execution_receipt_id, drift_receipt_id]
     view["spec"]["generated_at"] = now
-    view["spec"]["view_hash"] = sha256_text(
-        "|".join(
-            node_ids
-            + list(view["spec"].get("active_edge_refs", []))
-            + list(view["spec"].get("active_contradiction_refs", []))
-            + list(view["spec"].get("unresolved_blocker_refs", []))
-            + [rendered_rel_path, execution_receipt_id, drift_receipt_id, corpus_id, now]
-        )
-    )
+    view["spec"]["view_hash"] = compute_view_hash(repo, subject_slug, view)
+    execution_receipt["spec"]["render_view_hash"] = view["spec"]["view_hash"]
+    validate_instance(repo, execution_receipt)
 
     ensure_required_fields(repo, VIEW_KIND, view["spec"])
     validate_instance(repo, view)
