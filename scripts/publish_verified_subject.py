@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 from promotion_preflight import PromotionRejected, SUBJECT, _yaml
+from render_binding import compute_view_hash
 from secure_projection_path import DEFAULT_STAGE_ROOT, read_rendered, replace_regular, stage_directory
 
 
@@ -25,11 +26,16 @@ def publish(repo: Path, subject: str, *, stage_root: Path = DEFAULT_STAGE_ROOT) 
     spec = execution["spec"]
     drift_spec = drift["spec"]
     view_spec = view["spec"]
+    try:
+        actual_view_hash = compute_view_hash(repo, subject, view)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise PromotionRejected(f"current render inputs could not be verified: {exc}") from exc
     if (spec.get("output_ref") != expected_ref or drift_spec.get("output_ref") != expected_ref
             or spec.get("target_view_ref") != view_spec.get("view_id")
             or drift_spec.get("target_view_ref") != view_spec.get("view_id")
             or drift_spec.get("current_view_hash") != view_spec.get("view_hash")
             or spec.get("render_view_hash") != view_spec.get("view_hash")
+            or actual_view_hash != view_spec.get("view_hash")
             or not isinstance(spec.get("render_view_hash"), str)
             or drift_spec.get("output_sha256") != spec.get("output_sha256")
             or drift_spec.get("drift_status") != "in_sync"

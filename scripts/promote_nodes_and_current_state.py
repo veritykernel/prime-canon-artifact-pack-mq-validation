@@ -12,6 +12,7 @@ import yaml
 
 from schema_contract import choose_enum, ensure_required_fields, validate_instance
 from promotion_preflight import PromotionRejected, preflight
+from render_binding import compute_view_hash
 
 NODE_KIND = "PRIME_CANON_NODE_V1"
 VIEW_KIND = "PRIME_CANON_CURRENT_STATE_VIEW_V1"
@@ -19,9 +20,6 @@ RECEIPT_KIND = "PRIME_CANON_REDUCTION_DECISION_RECEIPT_V1"
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-def sha256_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 def claim_seq_from_path(path: Path) -> str:
     return path.stem.replace("claim-", "")
@@ -311,8 +309,6 @@ def main() -> None:
 
     view_id = f"pc.current_state_view.{subject_slug}.v1"
     view_rel_path = f"views/current/{subject_slug}.yaml"
-    view_hash = sha256_text("|".join(node_ids + node_receipt_ids + [packet_id, readiness_summary_id, replay_manifest_id, corpus_id]))
-
     current_view = {
         "kind": VIEW_KIND,
         "version": "v1",
@@ -380,12 +376,14 @@ def main() -> None:
             "active_edge_refs": [],
             "active_contradiction_refs": [],
             "unresolved_blocker_refs": [],
-            "view_hash": view_hash,
+            "view_hash": "0" * 64,
             "derivation_receipt_refs": node_receipt_ids + [packet_id, readiness_summary_id, replay_manifest_id],
             "rendered_projection_refs": [],
             "generated_at": now,
         },
     }
+
+    current_view["spec"]["view_hash"] = compute_view_hash(repo, subject_slug, current_view)
 
     ensure_required_fields(repo, VIEW_KIND, current_view["spec"])
     validate_instance(repo, current_view)

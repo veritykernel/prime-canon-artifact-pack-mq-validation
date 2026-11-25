@@ -11,6 +11,7 @@ from pathlib import Path
 import yaml
 
 from promotion_preflight import PromotionRejected
+from render_binding import compute_view_hash
 from secure_projection_path import read_rendered, subject_name
 
 SHA256 = re.compile(r"[a-f0-9]{64}\Z")
@@ -46,7 +47,11 @@ def check(repo: Path, subject: str) -> tuple[str, str]:
         return "missing_output", "render_refresh"
     if hashlib.sha256(raw).hexdigest() != expected_sha:
         return "out_of_sync", "render_refresh"
-    if view_spec.get("view_hash") != baseline:
+    try:
+        current_view_hash = compute_view_hash(repo, subject, view)
+    except (OSError, ValueError, KeyError, TypeError):
+        return "stale_view", "render_refresh"
+    if view_spec.get("view_hash") != baseline or current_view_hash != baseline:
         return "stale_view", "render_refresh"
     return "in_sync", "export_prep"
 

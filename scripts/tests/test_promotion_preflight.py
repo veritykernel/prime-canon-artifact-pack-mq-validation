@@ -18,6 +18,7 @@ from promotion_preflight import PromotionRejected, preflight
 import promote_nodes_and_current_state
 from publish_verified_subject import publish
 from check_render_drift import check as check_drift
+from render_binding import compute_view_hash
 from secure_projection_path import write_rendered
 
 
@@ -220,6 +221,8 @@ class VerifiedPublicationTests(unittest.TestCase):
         self.repo = self.root / "repo"
         for directory in ("control", "receipts", "views"):
             shutil.copytree(SOURCE / directory, self.repo / directory)
+        (self.repo / "canon").mkdir()
+        shutil.copytree(SOURCE / "canon" / "nodes", self.repo / "canon" / "nodes")
         self.stage = self.root / "stage"
         self.stage.mkdir()
         self.target = self.stage / f"{SUBJECT}.rendered.md"
@@ -228,10 +231,18 @@ class VerifiedPublicationTests(unittest.TestCase):
         cfg["subjects"][SUBJECT]["rendered_markdown_path"] = str(self.target)
         cfg_path.write_text(yaml.safe_dump(cfg))
         execution_path = self.repo / "receipts" / "immutable" / SUBJECT / "render-execution.yaml"
+        drift_path = self.repo / "receipts" / "immutable" / SUBJECT / "render-drift.yaml"
+        view_path = self.repo / "views" / "current" / f"{SUBJECT}.yaml"
         execution = yaml.safe_load(execution_path.read_text())
-        view = yaml.safe_load((self.repo / "views" / "current" / f"{SUBJECT}.yaml").read_text())
-        execution["spec"]["render_view_hash"] = view["spec"]["view_hash"]
+        drift = yaml.safe_load(drift_path.read_text())
+        view = yaml.safe_load(view_path.read_text())
+        current_hash = compute_view_hash(self.repo, SUBJECT, view)
+        view["spec"]["view_hash"] = current_hash
+        execution["spec"]["render_view_hash"] = current_hash
+        drift["spec"]["current_view_hash"] = current_hash
+        view_path.write_text(yaml.safe_dump(view, sort_keys=False))
         execution_path.write_text(yaml.safe_dump(execution, sort_keys=False))
+        drift_path.write_text(yaml.safe_dump(drift, sort_keys=False))
 
     def test_publishes_the_verified_bytes(self):
         self.assertEqual(publish(self.repo, SUBJECT, stage_root=self.stage), self.target)
@@ -308,9 +319,25 @@ class VerifiedPublicationTests(unittest.TestCase):
         with self.assertRaisesRegex(PromotionRejected, "render receipts"):
             publish(self.repo, SUBJECT, stage_root=self.stage)
 
+    def test_node_and_render_policy_mutations_stale_the_frozen_view(self):
+        node = self.repo / "canon" / "nodes" / SUBJECT / "node-0001.yaml"
+        original_node = node.read_bytes()
+        node.write_bytes(original_node + b"\n# post-receipt edit\n")
+        self.assertEqual(check_drift(self.repo, SUBJECT), ("stale_view", "render_refresh"))
+        with self.assertRaisesRegex(PromotionRejected, "render inputs could not be verified|render receipts"):
+            publish(self.repo, SUBJECT, stage_root=self.stage)
+
+        node.write_bytes(original_node)
+        self.assertEqual(check_drift(self.repo, SUBJECT), ("in_sync", "export_prep"))
+        policy = self.repo / "control" / "render" / "render-order.default.yaml"
+        policy.write_bytes(policy.read_bytes() + b"\n# post-receipt edit\n")
+        self.assertEqual(check_drift(self.repo, SUBJECT), ("stale_view", "render_refresh"))
+        with self.assertRaisesRegex(PromotionRejected, "render inputs could not be verified|render receipts"):
+            publish(self.repo, SUBJECT, stage_root=self.stage)
+
     def test_successor_render_freezes_current_view_hash_in_execution(self):
-        for directory in ("canon", "schemas"):
-            shutil.copytree(SOURCE / directory, self.repo / directory)
+        shutil.copytree(SOURCE / "canon", self.repo / "canon", dirs_exist_ok=True)
+        shutil.copytree(SOURCE / "schemas", self.repo / "schemas")
         result = subprocess.run([sys.executable, str(SOURCE / "scripts" / "build_rendered_projection.py"),
                                  str(self.repo), SUBJECT], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)

@@ -9,6 +9,7 @@ from pathlib import Path
 import yaml
 
 from schema_contract import choose_enum, ensure_required_fields, validate_instance
+from render_binding import compute_view_hash
 from secure_projection_path import subject_name, write_rendered
 
 PROFILE_KIND = "PRIME_CANON_RENDER_PROFILE_V1"
@@ -20,9 +21,6 @@ NODE_KIND = "PRIME_CANON_NODE_V1"
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-def sha256_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 def load_yaml(path: Path):
     if not path.exists():
@@ -432,15 +430,7 @@ def main() -> None:
     view["spec"]["rendered_projection_refs"] = [rendered_rel_path]
     view["spec"]["derivation_receipt_refs"] = prior_receipts + [execution_receipt_id, drift_receipt_id]
     view["spec"]["generated_at"] = now
-    view["spec"]["view_hash"] = sha256_text(
-        "|".join(
-            node_ids
-            + list(view["spec"].get("active_edge_refs", []))
-            + list(view["spec"].get("active_contradiction_refs", []))
-            + list(view["spec"].get("unresolved_blocker_refs", []))
-            + [rendered_rel_path, execution_receipt_id, drift_receipt_id, corpus_id, now]
-        )
-    )
+    view["spec"]["view_hash"] = compute_view_hash(repo, subject_slug, view)
     execution_receipt["spec"]["render_view_hash"] = view["spec"]["view_hash"]
     validate_instance(repo, execution_receipt)
 
